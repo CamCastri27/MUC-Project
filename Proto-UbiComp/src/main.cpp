@@ -5,7 +5,7 @@ The motors each draw 85mA of current, so we are using a transistor to power them
 this makes analog voltages impossible to do, not to mention the ESP32-C6 doesn't contain a DAC.
 To get around this, we are using Pulse Width Modulation (PWM) to control vibrational intensity.
 
-Created by Jordan Smith, Howard Mak, Auska Wang, and Camilo
+Created by Jordan Smith, Howard Mak, Auska Wang, and Camilo Castrillon
 
 */ 
 const u8_t pins[5] = {4, 5, 6, 7, 8};
