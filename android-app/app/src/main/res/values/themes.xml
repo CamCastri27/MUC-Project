@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.HapticGlove" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#FFF6F1EC</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
