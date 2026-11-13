@@ -1,0 +1,25 @@
+100% usable pins for motors/battery indication:
+{
+	4,
+	16,
+	17,
+	18,
+	19,
+	23,
+	25,
+	26,
+	27,
+	32,
+	33
+};
+
+22 can also be used, it is routed to the on board led tho. . . . . . 
+
+For only battery checking (no output support):
+{
+	34,
+	35,
+	36,
+	39
+}
+
