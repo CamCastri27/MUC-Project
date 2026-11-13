@@ -94,4 +94,5 @@ void communications(void* params){
     }
 }
 
+// Because we are threading, theres no need to use loop anymore. Kinda just want to avoid a messy super loop anyways.
 void loop(){}

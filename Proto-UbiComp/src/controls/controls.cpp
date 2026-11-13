@@ -31,7 +31,7 @@ void Motor::init(){
 
 void Motor::setIntensity(int idx, uint8_t intensity){
     if (idx >= numMotors || !initialized[idx]) return;
-    ledcWrite(idx, intensity);  
+    ledcWrite(idx, map(intensity, 1, 100, 57, 120));  
 }
 
 void Motor::freeze(){
