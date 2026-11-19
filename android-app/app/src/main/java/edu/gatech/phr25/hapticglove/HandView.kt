@@ -213,12 +213,12 @@ private val NailEdge = Color(0xFFD9A99A)
 private val Highlight = Color(0xFF2F6FED)     // outline of the selected finger
 private val HighlightFill = Color(0xFFD9E5FD) // fill of the selected finger
 private val MotorOff = Color(0xFF9AA0A6)      // ring of a motor dot that is off
-private val MotorOn = Color(0xFF2F6FED)       // motor dot that is on (darker = higher intensity)
+private val MotorOn = Color(0xFF2F6FED)       // motor dot that is on
 
 /**
  * Draws the hand and handles taps.
  *
- * @param motors      on/off + intensity for each motor, indexed by [Finger.ordinal].
+ * @param motors      on/off for each motor, indexed by [Finger.ordinal].
  * @param selected    the finger currently highlighted, or null.
  * @param onFingerTap called with the tapped finger, or null if the tap missed every finger.
  */
@@ -295,15 +295,14 @@ fun HandView(
                 val c = f.motor
                 val r = 3.4f // EDIT: motor dot radius in grid units
                 if (m.on) {
-                    // Pulse ring: grows and fades out; bigger and stronger at higher intensity.
-                    // EDIT: 4.5f = how far the ring expands beyond the dot.
-                    val strength = 0.3f + 0.7f * m.intensity / 100f
+                    // Pulse ring: grows and fades out.
+                    // EDIT: 4.5f = how far the ring expands beyond the dot; 0.5f = starting opacity.
                     drawCircle(
-                        MotorOn.copy(alpha = (1f - pulse) * 0.5f * strength),
-                        radius = r + pulse * 4.5f * strength, center = c,
+                        MotorOn.copy(alpha = (1f - pulse) * 0.5f),
+                        radius = r + pulse * 4.5f, center = c,
                     )
-                    // Solid dot: 35% opaque at 0% intensity, fully opaque at 100%.
-                    drawCircle(MotorOn.copy(alpha = 0.35f + 0.65f * m.intensity / 100f), r, c)
+                    // Solid blue dot.
+                    drawCircle(MotorOn, r, c)
                 } else {
                     // Off: white dot with a grey ring.
                     drawCircle(Color.White, r, c)

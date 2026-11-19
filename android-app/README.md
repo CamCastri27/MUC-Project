@@ -6,6 +6,7 @@ See the [main README](../README.md) for:
 
 - [Opening the test environment (emulator)](../README.md#open-the-test-environment-emulator)
 - [Connecting to the glove](../README.md#connect-to-the-glove)
+- [Using the app: manual control, battery, random patterns](../README.md#using-the-app)
 - [Where to change things](../README.md#where-to-change-things)
 
 Quick start on macOS:

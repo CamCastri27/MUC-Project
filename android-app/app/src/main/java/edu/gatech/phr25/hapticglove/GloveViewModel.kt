@@ -1,14 +1,18 @@
 package edu.gatech.phr25.hapticglove
 
 import android.app.Application
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlin.random.Random
 
 /*
  * APP LOGIC — holds the state of all five motors and decides what to send to the glove.
@@ -19,6 +23,30 @@ import kotlinx.coroutines.launch
  * calls `wake.trySend(Unit)` to send the changes, and call it from a button in MainActivity.kt.
  */
 
+// ---- Random patterns ----
+// EDIT: how long one random-pattern session runs before stopping by itself (4 hours).
+private const val PATTERN_SESSION_MS = 4 * 60 * 60 * 1000L
+// EDIT: how many motors each pattern turns on (picked at random in this range, inclusive).
+private const val PATTERN_MIN_MOTORS = 1
+private const val PATTERN_MAX_MOTORS = 5
+// EDIT: how long each pattern stays on (picked at random in this range, inclusive), in milliseconds.
+private const val PATTERN_MIN_MS = 5_000L
+private const val PATTERN_MAX_MS = 10_000L
+// EDIT: pause with all motors off between patterns (0 = next pattern starts immediately).
+private const val PATTERN_GAP_MS = 0L
+
+/**
+ * A running random-pattern session. Times are SystemClock.elapsedRealtime() values.
+ * @param number   1 for the first pattern, 2 for the second, ...
+ * @param fingers  motors that are on in the current pattern
+ */
+data class PatternSession(
+    val endsAt: Long,
+    val number: Int = 0,
+    val fingers: List<Finger> = emptyList(),
+    val stepEndsAt: Long = 0L,
+)
+
 /** Everything the screen needs to draw itself. */
 data class GloveUiState(
     /** One entry per motor, indexed by Finger.ordinal (THUMB = 0 ... PINKY = 4). */
@@ -27,8 +55,10 @@ data class GloveUiState(
     val selected: Finger? = null,
     /** true = don't use Bluetooth, just log what would be sent. */
     val demoMode: Boolean = false,
-    /** Most recent packets "sent" — shown in Demo mode so you can verify what the ESP32 would receive. */
+    /** Most recent commands "sent" — shown in Demo mode so you can verify what the ESP32 would receive. */
     val log: List<String> = emptyList(),
+    /** Random-pattern session in progress, or null. Manual controls are locked while it runs. */
+    val pattern: PatternSession? = null,
 )
 
 class GloveViewModel(app: Application) : AndroidViewModel(app) {
@@ -39,10 +69,13 @@ class GloveViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(GloveUiState())
     val ui: StateFlow<GloveUiState> = _ui.asStateFlow()
 
-    // Slider drags fire many updates per second; BLE can only take one write at a time.
+    // Taps can come faster than BLE writes (one at a time).
     // We keep only the latest desired state per motor and send whatever has changed.
     private val wake = Channel<Unit>(Channel.CONFLATED)
     private val lastSent = arrayOfNulls<MotorState>(Finger.entries.size)
+
+    // The coroutine running the random patterns, or null.
+    private var patternJob: Job? = null
 
     init {
         // Background loop: every time something changes, send the differences to the glove.
@@ -63,19 +96,71 @@ class GloveViewModel(app: Application) : AndroidViewModel(app) {
     /** On/off switch for one finger. */
     fun setOn(finger: Finger, on: Boolean) = updateMotor(finger) { it.copy(on = on) }
 
-    /** Intensity slider for one finger (0-100). */
-    fun setIntensity(finger: Finger, intensity: Int) = updateMotor(finger) { it.copy(intensity = intensity) }
-
-    /** Turns every motor on at the same intensity (the "All On" button passes ALL_ON_INTENSITY). */
-    fun allOn(intensity: Int) {
-        _ui.update { s -> s.copy(motors = s.motors.map { MotorState(on = true, intensity = intensity) }) }
+    /** Turns every motor on (at the fixed GloveProtocol.MOTOR_INTENSITY). */
+    fun allOn() {
+        _ui.update { s -> s.copy(motors = s.motors.map { MotorState(on = true) }) }
         wake.trySend(Unit)
     }
 
-    /** Turns every motor off. Each motor keeps its intensity for the next time it's turned on. */
+    /** Turns every motor off. */
     fun allOff() {
-        _ui.update { s -> s.copy(motors = s.motors.map { it.copy(on = false) }) }
+        _ui.update { s -> s.copy(motors = s.motors.map { MotorState(on = false) }) }
         wake.trySend(Unit)
+    }
+
+    /**
+     * "Random patterns" button. Until PATTERN_SESSION_MS has passed (or [stopPatterns] is called),
+     * repeatedly turns on a random set of PATTERN_MIN_MOTORS..PATTERN_MAX_MOTORS motors for a random
+     * PATTERN_MIN_MS..PATTERN_MAX_MS, with every other motor off. All motors are off when it ends.
+     */
+    fun startPatterns() {
+        if (patternJob?.isActive == true) return
+        val endsAt = SystemClock.elapsedRealtime() + PATTERN_SESSION_MS
+        _ui.update { it.copy(pattern = PatternSession(endsAt), selected = null) }
+        addLog("Random patterns started (${PATTERN_SESSION_MS / 60_000} min)")
+        patternJob = viewModelScope.launch {
+            try {
+                var number = 0
+                while (true) {
+                    val remaining = endsAt - SystemClock.elapsedRealtime()
+                    if (remaining <= 0) break
+                    number++
+                    val count = Random.nextInt(PATTERN_MIN_MOTORS, PATTERN_MAX_MOTORS + 1)
+                    val fingers = Finger.entries.shuffled().take(count).sortedBy { it.ordinal }
+                    // The last pattern is cut short so the session ends on time.
+                    val duration = Random.nextLong(PATTERN_MIN_MS, PATTERN_MAX_MS + 1).coerceAtMost(remaining)
+                    _ui.update { s ->
+                        s.copy(
+                            motors = Finger.entries.map { MotorState(on = it in fingers) },
+                            pattern = s.pattern?.copy(
+                                number = number,
+                                fingers = fingers,
+                                stepEndsAt = SystemClock.elapsedRealtime() + duration,
+                            ),
+                        )
+                    }
+                    addLog("Pattern $number: ${fingers.joinToString { it.label }} for ${duration / 1000.0} s")
+                    wake.trySend(Unit)
+                    delay(duration)
+                    if (PATTERN_GAP_MS > 0) {
+                        allOff()
+                        delay(PATTERN_GAP_MS)
+                    }
+                }
+                addLog("Random patterns finished")
+            } finally {
+                // Runs on finish AND on Stop: turn everything off and clear the session.
+                _ui.update { s -> s.copy(motors = s.motors.map { MotorState(on = false) }, pattern = null) }
+                wake.trySend(Unit)
+                patternJob = null
+            }
+        }
+    }
+
+    /** "Stop" button: ends the random-pattern session early and turns all motors off. */
+    fun stopPatterns() {
+        if (patternJob?.isActive == true) addLog("Random patterns stopped")
+        patternJob?.cancel()
     }
 
     /** Demo switch. Turning it on disconnects from the glove. */
@@ -96,7 +181,7 @@ class GloveViewModel(app: Application) : AndroidViewModel(app) {
         wake.trySend(Unit)
     }
 
-    /** Sends one packet for every motor whose state differs from what the glove last received. */
+    /** Sends one command for every motor whose state differs from what the glove last received. */
     private suspend fun flush() {
         val s = _ui.value
         val connected = ble.state.value is ConnectionState.Connected
@@ -104,19 +189,22 @@ class GloveViewModel(app: Application) : AndroidViewModel(app) {
         for (finger in Finger.entries) {
             val desired = s.motors[finger.ordinal]
             if (desired == lastSent[finger.ordinal]) continue
-            val ok = if (s.demoMode) true else ble.writeMotor(finger.ordinal, desired.on, desired.intensity)
+            val ok = if (s.demoMode) true else ble.writeMotor(finger.ordinal, desired.on)
             if (ok) lastSent[finger.ordinal] = desired
             log(finger, desired, ok)
         }
-        // If the user kept dragging while we were writing, go again.
+        // If the user changed something while we were writing, go again.
         if (_ui.value.motors != s.motors) wake.trySend(Unit)
     }
 
-    /** Adds a line to the Demo log, e.g. "Index  pin 5  ON   40%  [01 01 28]". Keeps the newest 30. */
+    /** Adds a line to the Demo log, e.g. "Index  pin 5  ON   "START 1 35"". Keeps the newest 30. */
     private fun log(finger: Finger, m: MotorState, ok: Boolean) {
-        val bytes = GloveProtocol.encode(finger.ordinal, m.on, m.intensity)
-            .joinToString(" ") { "%02X".format(it) }
-        val line = "${finger.label.padEnd(6)} pin ${finger.pin}  ${if (m.on) "ON " else "OFF"} ${m.intensity.toString().padStart(3)}%  [$bytes]${if (ok) "" else "  FAILED"}"
+        val cmd = GloveProtocol.command(finger.ordinal, m.on)
+        addLog("${finger.label.padEnd(6)} pin ${finger.pin}  ${if (m.on) "ON " else "OFF"}  \"$cmd\"${if (ok) "" else "  FAILED"}")
+    }
+
+    /** Adds any line to the Demo log. */
+    private fun addLog(line: String) {
         _ui.update { it.copy(log = (listOf(line) + it.log).take(30)) }
     }
 

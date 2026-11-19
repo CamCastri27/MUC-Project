@@ -5,6 +5,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
@@ -22,12 +23,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /*
- * BLUETOOTH — finds the glove, connects to it, and sends motor packets.
+ * BLUETOOTH — finds the glove, connects to it, sends motor commands and listens for its replies.
  * Usually nothing here needs editing. The glove's name and IDs are in GloveProtocol.kt, and
  * the timeouts are at the bottom of this file.
  *
  * Steps: connect() scans for the glove -> connectTo() opens a connection ->
- * onServicesDiscovered() finds the motor characteristic -> Connected -> writeMotor() sends packets.
+ * onServicesDiscovered() finds the command characteristic and queues the setup steps (turn on
+ * reply + battery notifications, read the battery) -> Connected -> writeMotor() sends text commands.
+ * Replies ("START_OK", ...) appear in [lastReply]; battery level appears in [battery].
  */
 
 /** Connection status shown in the ConnectionBar on the main screen. */
@@ -39,8 +42,21 @@ sealed interface ConnectionState {
     data class Error(val message: String) : ConnectionState
 }
 
+/** Glove battery, from the battery characteristic: 2 bytes = [level 0-100, charging 0|1]. */
+data class BatteryInfo(val level: Int, val charging: Boolean) {
+    companion object {
+        fun parse(bytes: ByteArray?): BatteryInfo? {
+            if (bytes == null || bytes.isEmpty()) return null
+            return BatteryInfo(
+                level = (bytes[0].toInt() and 0xFF).coerceIn(0, 100),
+                charging = bytes.size > 1 && bytes[1].toInt() != 0,
+            )
+        }
+    }
+}
+
 /**
- * Minimal BLE central: scans for the glove, connects, and writes motor packets.
+ * Minimal BLE central: scans for the glove, connects, and writes motor commands.
  * Permissions must already be granted before calling [connect].
  */
 @SuppressLint("MissingPermission")
@@ -53,7 +69,19 @@ class BleController(context: Context) {
     val state: StateFlow<ConnectionState> = _state
 
     private var gatt: BluetoothGatt? = null
-    private var motorChar: BluetoothGattCharacteristic? = null
+    private var commandChar: BluetoothGattCharacteristic? = null
+
+    // Latest text the glove sent back on the confirm characteristic (e.g. "START_OK"), or null.
+    private val _lastReply = MutableStateFlow<String?>(null)
+    val lastReply: StateFlow<String?> = _lastReply
+
+    // Latest glove battery reading, or null if not connected / the glove doesn't report it.
+    private val _battery = MutableStateFlow<BatteryInfo?>(null)
+    val battery: StateFlow<BatteryInfo?> = _battery
+
+    // Setup work to do after connecting, one BLE operation at a time. Each step returns true if it
+    // started an operation (we then wait for its callback), false to skip straight to the next one.
+    private val setupSteps = ArrayDeque<(BluetoothGatt) -> Boolean>()
     private var pendingWrite: CompletableDeferred<Boolean>? = null
     private var scanning = false
 
@@ -84,16 +112,19 @@ class BleController(context: Context) {
         gatt?.disconnect()
         gatt?.close()
         gatt = null
-        motorChar = null
+        commandChar = null
         pendingWrite?.complete(false)
+        _lastReply.value = null
+        _battery.value = null
+        setupSteps.clear()
         _state.value = ConnectionState.Disconnected
     }
 
-    /** Writes one motor packet and suspends until the ESP32 acknowledges it (or timeout). */
-    suspend fun writeMotor(index: Int, on: Boolean, intensity: Int): Boolean {
+    /** Writes one motor command and suspends until the ESP32 acknowledges it (or timeout). */
+    suspend fun writeMotor(index: Int, on: Boolean): Boolean {
         val g = gatt ?: return false
-        val c = motorChar ?: return false
-        val payload = GloveProtocol.encode(index, on, intensity)
+        val c = commandChar ?: return false
+        val payload = GloveProtocol.encode(index, on)
         val done = CompletableDeferred<Boolean>()
         pendingWrite = done
         val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -160,8 +191,10 @@ class BleController(context: Context) {
                     g.close()
                     if (gatt == g) {
                         gatt = null
-                        motorChar = null
+                        commandChar = null
                         pendingWrite?.complete(false)
+                        _battery.value = null
+                        setupSteps.clear()
                         _state.value = if (status == BluetoothGatt.GATT_SUCCESS) {
                             ConnectionState.Disconnected
                         } else {
@@ -173,25 +206,100 @@ class BleController(context: Context) {
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            val c = g.getService(GloveProtocol.SERVICE_UUID)?.getCharacteristic(GloveProtocol.MOTOR_CHAR_UUID)
+            val service = g.getService(GloveProtocol.SERVICE_UUID)
+            val c = service?.getCharacteristic(GloveProtocol.COMMAND_UUID)
             if (c == null) {
-                fail("Connected, but the glove's motor service was not found. Flash the latest firmware.")
+                fail("Connected, but the glove's command service was not found. Flash the latest firmware.")
                 g.disconnect()
                 return
             }
-            motorChar = c
-            _state.value = ConnectionState.Connected(g.device.name ?: GloveProtocol.DEVICE_NAME)
+            commandChar = c
+            // BLE can only do one operation at a time, so these run in order and we report
+            // Connected once they're all done. Missing characteristics are skipped.
+            val confirm = service.getCharacteristic(GloveProtocol.CONFIRM_UUID)
+            val battery = service.getCharacteristic(GloveProtocol.BATTERY_UUID)
+            setupSteps.clear()
+            setupSteps.add { confirm != null && enableNotifications(it, confirm) }
+            setupSteps.add { battery != null && enableNotifications(it, battery) }
+            setupSteps.add { battery != null && it.readCharacteristic(battery) }
+            runNextSetupStep(g)
+        }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
+            runNextSetupStep(g)
+        }
+
+        // Battery read finished, Android 13+.
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+            if (c.uuid == GloveProtocol.BATTERY_UUID && status == BluetoothGatt.GATT_SUCCESS) _battery.value = BatteryInfo.parse(value)
+            runNextSetupStep(g)
+        }
+
+        // Battery read finished, Android 12 and older.
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            @Suppress("DEPRECATION")
+            if (c.uuid == GloveProtocol.BATTERY_UUID && status == BluetoothGatt.GATT_SUCCESS) _battery.value = BatteryInfo.parse(c.value)
+            runNextSetupStep(g)
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
             pendingWrite?.complete(status == BluetoothGatt.GATT_SUCCESS)
+        }
+
+        // Glove reply or battery update, Android 13+.
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
+            onNotification(c, value)
+        }
+
+        // Glove reply or battery update, Android 12 and older.
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            @Suppress("DEPRECATION")
+            onNotification(c, c.value)
+        }
+    }
+
+    private fun onNotification(c: BluetoothGattCharacteristic, value: ByteArray?) {
+        when (c.uuid) {
+            GloveProtocol.CONFIRM_UUID -> _lastReply.value = value?.toString(Charsets.UTF_8)
+            GloveProtocol.BATTERY_UUID -> BatteryInfo.parse(value)?.let { _battery.value = it }
+        }
+    }
+
+    /** Starts the next setup step that applies; reports Connected when none are left. */
+    private fun runNextSetupStep(g: BluetoothGatt) {
+        if (gatt != g) return
+        while (setupSteps.isNotEmpty()) {
+            if (setupSteps.removeFirst()(g)) return // wait for its callback
+        }
+        markConnected(g)
+    }
+
+    private fun markConnected(g: BluetoothGatt) {
+        if (gatt != g) return
+        _state.value = ConnectionState.Connected(g.device.name ?: GloveProtocol.DEVICE_NAME)
+    }
+
+    /** Subscribes to a notify characteristic. Returns false if the request couldn't be started. */
+    private fun enableNotifications(g: BluetoothGatt, c: BluetoothGattCharacteristic): Boolean {
+        if (!g.setCharacteristicNotification(c, true)) return false
+        val d = c.getDescriptor(GloveProtocol.CLIENT_CONFIG_UUID) ?: return false
+        val value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeDescriptor(d, value) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            d.value = value
+            @Suppress("DEPRECATION")
+            g.writeDescriptor(d)
         }
     }
 
     companion object {
         // EDIT: how long to search for the glove before showing "Glove not found" (milliseconds).
         private const val SCAN_TIMEOUT_MS = 10_000L
-        // EDIT: how long to wait for the glove to confirm each packet before marking it FAILED.
+        // EDIT: how long to wait for the glove to confirm each command before marking it FAILED.
         private const val WRITE_TIMEOUT_MS = 1_000L
     }
 }
