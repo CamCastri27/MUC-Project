@@ -197,10 +197,10 @@ class GloveViewModel(app: Application) : AndroidViewModel(app) {
         if (_ui.value.motors != s.motors) wake.trySend(Unit)
     }
 
-    /** Adds a line to the Demo log, e.g. "Index  pin 5  ON   "START 1 35"". Keeps the newest 30. */
+    /** Adds a line to the Demo log, e.g. "Index  pin 5  ON   [1, 1, 35]". Keeps the newest 30. */
     private fun log(finger: Finger, m: MotorState, ok: Boolean) {
         val cmd = GloveProtocol.command(finger.ordinal, m.on)
-        addLog("${finger.label.padEnd(6)} pin ${finger.pin}  ${if (m.on) "ON " else "OFF"}  \"$cmd\"${if (ok) "" else "  FAILED"}")
+        addLog("${finger.label.padEnd(6)} pin ${finger.pin}  ${if (m.on) "ON " else "OFF"}  $cmd${if (ok) "" else "  FAILED"}")
     }
 
     /** Adds any line to the Demo log. */

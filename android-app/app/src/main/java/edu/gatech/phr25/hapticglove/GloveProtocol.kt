@@ -15,13 +15,20 @@ object GloveProtocol {
     /** Matches SERVICE_UUID in communciations.h. */
     val SERVICE_UUID: UUID = UUID.fromString("bee1b769-d394-4dde-8dfa-8117e8b231ac")
 
-    /** App -> glove. Write-only; each write is one text command (see [command]). Matches COMMAND_UUID. */
-    val COMMAND_UUID: UUID = UUID.fromString("50ec874d-2a01-4f0b-93d0-66b6217a5c30")
+    /**
+     * App -> glove. Write-only; each write is one 3-byte motor packet (see [encode]).
+     * Matches MOTOR_CHAR_UUID in Proto-UbiComp/src/main.cpp (the firmware currently on the glove).
+     * The newer comm/ firmware uses COMMAND_UUID "50ec874d-2a01-4f0b-93d0-66b6217a5c30" with text
+     * commands instead; switch back to that UUID and format if the team moves to that firmware.
+     */
+    val COMMAND_UUID: UUID = UUID.fromString("8f1d0002-6b5a-4c2e-9a3e-5c1f0e7a2b10")
 
-    /** Glove -> app. Notify-only; the glove replies with text like "START_OK". Matches CONFIRM_UUID. */
+    /** Glove -> app. Notify-only; the glove replies with text like "START_OK". Matches CONFIRM_UUID.
+     *  Optional: main.cpp doesn't have it yet, so the app skips it (no replies shown). */
     val CONFIRM_UUID: UUID = UUID.fromString("bbc224f9-1c69-458e-ad8f-d8a9f328bb32")
 
-    /** Glove -> app. Read + notify; 2 bytes = [battery level 0-100, charging 0|1]. Matches BATTERY_UUID. */
+    /** Glove -> app. Read + notify; 2 bytes = [battery level 0-100, charging 0|1]. Matches BATTERY_UUID.
+     *  Optional: main.cpp doesn't have it yet, so the app skips it (no battery shown). */
     val BATTERY_UUID: UUID = UUID.fromString("5e6fc8e7-34a8-4c3a-a32b-54994614007d")
 
     /** Standard BLE descriptor the app writes to turn on notifications (the BLE2902 in the firmware). */
@@ -37,16 +44,19 @@ object GloveProtocol {
     const val UNKNOWN_REPLY = "UNKNOWN_COMMAND"
 
     /**
-     * Text command for one motor, matching the firmware's Command enum + DeviceCommand struct:
-     *   on  -> "START <motorIndex> <intensity>"   e.g. "START 1 35"
-     *   off -> "STOP <motorIndex>"                e.g. "STOP 1"
+     * The bytes written over Bluetooth for one motor, matching MotorCallbacks in main.cpp:
+     *   3 bytes = [motorIndex 0-4, on 0|1, intensity 0-100]   e.g. [1, 1, 35] or [1, 0, 0]
      * EDIT: if the firmware team settles on a different format, change it only here.
      */
-    fun command(motorIndex: Int, on: Boolean): String =
-        if (on) "START $motorIndex ${MOTOR_INTENSITY.coerceIn(0, 100)}" else "STOP $motorIndex"
+    fun encode(motorIndex: Int, on: Boolean): ByteArray = byteArrayOf(
+        motorIndex.toByte(),
+        (if (on) 1 else 0).toByte(),
+        (if (on) MOTOR_INTENSITY.coerceIn(0, 100) else 0).toByte(),
+    )
 
-    /** The bytes actually written over Bluetooth: the command as plain text. */
-    fun encode(motorIndex: Int, on: Boolean): ByteArray = command(motorIndex, on).toByteArray(Charsets.UTF_8)
+    /** Readable form of [encode] for the Demo log, e.g. "[1, 1, 35]". */
+    fun command(motorIndex: Int, on: Boolean): String =
+        encode(motorIndex, on).joinToString(prefix = "[", postfix = "]") { (it.toInt() and 0xFF).toString() }
 }
 
 /**

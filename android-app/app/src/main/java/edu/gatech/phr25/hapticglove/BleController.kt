@@ -29,7 +29,7 @@ import kotlinx.coroutines.flow.StateFlow
  *
  * Steps: connect() scans for the glove -> connectTo() opens a connection ->
  * onServicesDiscovered() finds the command characteristic and queues the setup steps (turn on
- * reply + battery notifications, read the battery) -> Connected -> writeMotor() sends text commands.
+ * reply + battery notifications, read the battery) -> Connected -> writeMotor() sends 3-byte motor packets.
  * Replies ("START_OK", ...) appear in [lastReply]; battery level appears in [battery].
  */
 
@@ -85,6 +85,10 @@ class BleController(context: Context) {
     private var pendingWrite: CompletableDeferred<Boolean>? = null
     private var scanning = false
 
+    // Android often fails a first connection attempt with status 133 (GATT_ERROR); we retry.
+    private var connectAttempts = 0
+    private var pendingConnect: Runnable? = null
+
     val isBluetoothAvailable: Boolean get() = adapter != null
     val isBluetoothOn: Boolean get() = adapter?.isEnabled == true
 
@@ -109,6 +113,8 @@ class BleController(context: Context) {
     /** Stops scanning and/or closes the connection. Safe to call at any time. */
     fun disconnect() {
         stopScan()
+        pendingConnect?.let { mainHandler.removeCallbacks(it) }
+        pendingConnect = null
         gatt?.disconnect()
         gatt?.close()
         gatt = null
@@ -167,7 +173,9 @@ class BleController(context: Context) {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             if (!scanning) return
             stopScan()
-            connectTo(result.device)
+            connectAttempts = 0
+            // Short pause after stopping the scan — connecting immediately causes 133 on many phones.
+            scheduleConnect(result.device, CONNECT_DELAY_MS)
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -176,7 +184,18 @@ class BleController(context: Context) {
         }
     }
 
+    private fun scheduleConnect(device: BluetoothDevice, delayMs: Long) {
+        _state.value = ConnectionState.Connecting(device.name ?: GloveProtocol.DEVICE_NAME)
+        val r = Runnable {
+            pendingConnect = null
+            connectTo(device)
+        }
+        pendingConnect = r
+        mainHandler.postDelayed(r, delayMs)
+    }
+
     private fun connectTo(device: BluetoothDevice) {
+        connectAttempts++
         val name = device.name ?: GloveProtocol.DEVICE_NAME
         _state.value = ConnectionState.Connecting(name)
         gatt = device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
@@ -189,6 +208,16 @@ class BleController(context: Context) {
                 BluetoothProfile.STATE_CONNECTED -> g.discoverServices()
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     g.close()
+                    // Failed before we finished connecting: retry a few times (runs on main thread).
+                    if (status != BluetoothGatt.GATT_SUCCESS && connectAttempts < MAX_CONNECT_ATTEMPTS) {
+                        mainHandler.post {
+                            if (gatt == g && _state.value is ConnectionState.Connecting) {
+                                gatt = null
+                                scheduleConnect(g.device, RETRY_DELAY_MS)
+                            }
+                        }
+                        if (_state.value is ConnectionState.Connecting) return
+                    }
                     if (gatt == g) {
                         gatt = null
                         commandChar = null
@@ -198,7 +227,13 @@ class BleController(context: Context) {
                         _state.value = if (status == BluetoothGatt.GATT_SUCCESS) {
                             ConnectionState.Disconnected
                         } else {
-                            ConnectionState.Error("Connection lost (status $status)")
+                            ConnectionState.Error(
+                                if (status == GATT_ERROR_133) {
+                                    "Couldn't connect (status 133). Restart the glove, toggle phone Bluetooth off/on, and try again."
+                                } else {
+                                    "Connection lost (status $status)"
+                                }
+                            )
                         }
                     }
                 }
@@ -301,5 +336,10 @@ class BleController(context: Context) {
         private const val SCAN_TIMEOUT_MS = 10_000L
         // EDIT: how long to wait for the glove to confirm each command before marking it FAILED.
         private const val WRITE_TIMEOUT_MS = 1_000L
+        // EDIT: how many times to try connecting before showing an error, and the pauses involved.
+        private const val MAX_CONNECT_ATTEMPTS = 3
+        private const val CONNECT_DELAY_MS = 300L
+        private const val RETRY_DELAY_MS = 600L
+        private const val GATT_ERROR_133 = 133
     }
 }
